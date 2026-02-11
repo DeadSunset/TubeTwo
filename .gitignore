@@ -1,0 +1,6 @@
+app/node_modules/
+data/mytube.db
+data/mytube.db-shm
+data/mytube.db-wal
+data/logs/
+data/thumbnails/
