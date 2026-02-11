@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Offline myTube</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app" class="app-shell">
+    <aside class="sidebar">
+      <div class="logo"><span class="logo-pill">my</span> Tube</div>
+      <nav class="menu">
+        <a href="#/" data-link>Главное</a>
+        <a href="#/shorts" data-link>Шортсы</a>
+        <a href="#/watched" data-link>Просмотренные</a>
+        <a href="#/liked" data-link>Понравившееся</a>
+        <a href="#/channels" data-link>Все каналы</a>
+      </nav>
+      <div class="popular-block">
+        <h3>Популярные каналы</h3>
+        <ul id="popularChannels"></ul>
+      </div>
+    </aside>
+
+    <main class="content">
+      <header class="topbar">
+        <input id="globalSearch" type="search" placeholder="Поиск видео..." />
+        <div class="top-actions">
+          <button id="addCommonBtn" class="btn-primary">Добавить общую папку</button>
+          <button id="addChannelBtn" class="btn-primary">Добавить канал</button>
+          <button id="addVideoBtn" class="btn-primary">Добавить видео</button>
+          <button id="profileBtn" class="avatar-btn" title="Профиль">👤</button>
+        </div>
+      </header>
+
+      <section id="bulkTaskPanel" class="panel hidden"></section>
+      <section id="routeView"></section>
+    </main>
+  </div>
+
+  <template id="emptyStateTpl">
+    <div class="panel empty-state">
+      <h2>Библиотека пока пустая</h2>
+      <p>Добавьте общую папку, отдельный канал или отдельные видео.</p>
+      <div class="action-row">
+        <button data-action="add-common" class="btn-primary">Добавить общую папку</button>
+        <button data-action="add-channel" class="btn-primary">Добавить канал</button>
+        <button data-action="add-video" class="btn-primary">Добавить видео</button>
+      </div>
+    </div>
+  </template>
+
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
