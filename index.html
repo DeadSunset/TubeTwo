@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Offline myTube</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="logo"><span class="logo-chip">my</span> Tube</div>
+      <nav class="nav" id="mainNav">
+        <a href="#/">Главное</a>
+        <a href="#/shorts">Шортсы</a>
+        <a href="#/watched">Просмотренные</a>
+        <a href="#/liked">Понравившееся</a>
+        <a href="#/channels">Все каналы</a>
+      </nav>
+      <section class="popular">
+        <h3>Популярные каналы</h3>
+        <ul id="popularChannels"></ul>
+      </section>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <input id="globalSearch" type="search" placeholder="Поиск видео..." />
+        <div class="top-actions">
+          <button id="addCommonBtn" class="btn">Добавить общую папку</button>
+          <button id="addChannelBtn" class="btn">Добавить канал</button>
+          <button id="addVideoBtn" class="btn">Добавить видео</button>
+          <button id="profileBtn" class="avatar-btn" title="Профиль">◉</button>
+        </div>
+      </header>
+
+      <section id="taskPanel" class="task-panel hidden"></section>
+      <section id="routeView" class="route-view"></section>
+    </div>
+  </div>
+
+  <template id="emptyState">
+    <article class="panel empty-state">
+      <h2>Библиотека пустая</h2>
+      <p>Добавьте источники: общую папку, канал или отдельные видео.</p>
+      <div class="actions-inline">
+        <button class="btn" data-add="common">Добавить общую папку</button>
+        <button class="btn" data-add="channel">Добавить канал</button>
+        <button class="btn" data-add="video">Добавить видео</button>
+      </div>
+    </article>
+  </template>
+
+  <script type="module" src="src/app.js"></script>
+</body>
+</html>
