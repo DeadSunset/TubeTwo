@@ -7,48 +7,48 @@
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <div id="app" class="app-shell">
+  <div class="layout">
     <aside class="sidebar">
-      <div class="logo"><span class="logo-pill">my</span> Tube</div>
-      <nav class="menu">
-        <a href="#/" data-link>Главное</a>
-        <a href="#/shorts" data-link>Шортсы</a>
-        <a href="#/watched" data-link>Просмотренные</a>
-        <a href="#/liked" data-link>Понравившееся</a>
-        <a href="#/channels" data-link>Все каналы</a>
+      <div class="logo"><span class="logo-chip">my</span> Tube</div>
+      <nav class="nav" id="mainNav">
+        <a href="#/">Главное</a>
+        <a href="#/shorts">Шортсы</a>
+        <a href="#/watched">Просмотренные</a>
+        <a href="#/liked">Понравившееся</a>
+        <a href="#/channels">Все каналы</a>
       </nav>
-      <div class="popular-block">
+      <section class="popular">
         <h3>Популярные каналы</h3>
         <ul id="popularChannels"></ul>
-      </div>
+      </section>
     </aside>
 
-    <main class="content">
+    <div class="main">
       <header class="topbar">
         <input id="globalSearch" type="search" placeholder="Поиск видео..." />
         <div class="top-actions">
-          <button id="addCommonBtn" class="btn-primary">Добавить общую папку</button>
-          <button id="addChannelBtn" class="btn-primary">Добавить канал</button>
-          <button id="addVideoBtn" class="btn-primary">Добавить видео</button>
-          <button id="profileBtn" class="avatar-btn" title="Профиль">👤</button>
+          <button id="addCommonBtn" class="btn">Добавить общую папку</button>
+          <button id="addChannelBtn" class="btn">Добавить канал</button>
+          <button id="addVideoBtn" class="btn">Добавить видео</button>
+          <button id="profileBtn" class="avatar-btn" title="Профиль">◉</button>
         </div>
       </header>
 
-      <section id="bulkTaskPanel" class="panel hidden"></section>
-      <section id="routeView"></section>
-    </main>
+      <section id="taskPanel" class="task-panel hidden"></section>
+      <section id="routeView" class="route-view"></section>
+    </div>
   </div>
 
-  <template id="emptyStateTpl">
-    <div class="panel empty-state">
-      <h2>Библиотека пока пустая</h2>
-      <p>Добавьте общую папку, отдельный канал или отдельные видео.</p>
-      <div class="action-row">
-        <button data-action="add-common" class="btn-primary">Добавить общую папку</button>
-        <button data-action="add-channel" class="btn-primary">Добавить канал</button>
-        <button data-action="add-video" class="btn-primary">Добавить видео</button>
+  <template id="emptyState">
+    <article class="panel empty-state">
+      <h2>Библиотека пустая</h2>
+      <p>Добавьте источники: общую папку, канал или отдельные видео.</p>
+      <div class="actions-inline">
+        <button class="btn" data-add="common">Добавить общую папку</button>
+        <button class="btn" data-add="channel">Добавить канал</button>
+        <button class="btn" data-add="video">Добавить видео</button>
       </div>
-    </div>
+    </article>
   </template>
 
   <script type="module" src="src/app.js"></script>

@@ -2,272 +2,281 @@ import { openDb, tx, reqP, getAll, putMany, deleteByKey } from './db.js';
 import { BatchQueue } from './queue.js';
 import { COMMON_CHANNEL_ID, uid, isVideoFile, formatDuration, escapeHtml, permissionOk, readVideoMeta, detectType, makeThumb, tokenize } from './utils.js';
 
-const state = { db: null, sources: [], channels: [], videos: [], search: '', route: location.hash || '#/' };
+const state = {
+  db: null,
+  route: location.hash || '#/',
+  search: '',
+  sources: [],
+  channels: [],
+  videos: [],
+};
 
 const els = {
   view: document.getElementById('routeView'),
   search: document.getElementById('globalSearch'),
+  task: document.getElementById('taskPanel'),
   popular: document.getElementById('popularChannels'),
-  bulkPanel: document.getElementById('bulkTaskPanel'),
 };
 
-bootstrap();
+await init();
 
-async function bootstrap() {
+async function init() {
   state.db = await openDb();
   await ensureSystemChannel();
   await hydrate();
-  bindGlobalUI();
+  bindTopBar();
   window.addEventListener('hashchange', () => { state.route = location.hash || '#/'; render(); });
+  await revalidateSources();
   render();
+}
+
+function bindTopBar() {
+  els.search.oninput = () => { state.search = els.search.value.trim().toLowerCase(); render(); };
+  document.getElementById('addCommonBtn').onclick = () => addSource('common');
+  document.getElementById('addChannelBtn').onclick = () => addSource('channel');
+  document.getElementById('addVideoBtn').onclick = () => addVideoFiles();
+  document.getElementById('profileBtn').onclick = () => location.hash = '#/profile';
 }
 
 async function ensureSystemChannel() {
   const { stores, trx } = tx(state.db, 'channels', 'readwrite');
   stores.channels.put({ channelId: COMMON_CHANNEL_ID, title: 'Общий канал', sourceId: 'system', system: true });
-  await new Promise((res, rej) => { trx.oncomplete = res; trx.onerror = () => rej(trx.error); });
+  await done(trx);
 }
 
 async function hydrate() {
   state.sources = await getAll(state.db, 'sources');
   state.channels = await getAll(state.db, 'channels');
   state.videos = await getAll(state.db, 'videos');
-  refreshPopular();
+  refreshPopularChannels();
 }
 
-function bindGlobalUI() {
-  els.search.addEventListener('input', () => { state.search = els.search.value.trim().toLowerCase(); render(); });
-  document.getElementById('profileBtn').onclick = () => { location.hash = '#/profile'; };
-  document.getElementById('addCommonBtn').onclick = () => addSource('common');
-  document.getElementById('addChannelBtn').onclick = () => addSource('channel');
-  document.getElementById('addVideoBtn').onclick = () => addVideosStandalone();
+async function revalidateSources() {
+  for (const s of state.sources) {
+    const ok = await safePermission(s.handle);
+    await markSourceAvailability(s.sourceId, ok);
+  }
+  await hydrate();
 }
 
-function matchesSearch(v) {
-  if (!state.search) return true;
-  const ch = state.channels.find((c) => c.channelId === v.channelId)?.title || '';
-  return `${v.title} ${ch}`.toLowerCase().includes(state.search);
+async function safePermission(handle) {
+  try {
+    return await permissionOk(handle);
+  } catch {
+    return false;
+  }
 }
 
 function render() {
   const route = state.route.replace(/^#/, '');
-  if (!state.videos.length && route === '/') {
-    const node = document.getElementById('emptyStateTpl').content.cloneNode(true);
-    node.querySelector('[data-action="add-common"]').onclick = () => addSource('common');
-    node.querySelector('[data-action="add-channel"]').onclick = () => addSource('channel');
-    node.querySelector('[data-action="add-video"]').onclick = () => addVideosStandalone();
-    els.view.replaceChildren(node);
-    return;
-  }
-  if (route.startsWith('/video/')) return renderVideoPage(decodeURIComponent(route.split('/video/')[1]));
+  if (!state.videos.length && route === '/') return renderEmpty();
+  if (route.startsWith('/video/')) return renderVideoPage(decodeURIComponent(route.slice('/video/'.length)));
+  if (route.startsWith('/channel/')) return renderSingleChannel(decodeURIComponent(route.slice('/channel/'.length)));
   if (route === '/channels') return renderChannels();
-  if (route.startsWith('/channel/')) return renderChannelPage(decodeURIComponent(route.split('/channel/')[1]));
   if (route === '/shorts') return renderFeed({ shortsOnly: true });
-  if (route === '/watched') return renderFeed({ watched: true });
-  if (route === '/liked') return renderFeed({ liked: true });
+  if (route === '/watched') return renderFeed({ watchedOnly: true });
+  if (route === '/liked') return renderFeed({ likedOnly: true });
   if (route === '/profile') return renderProfile();
   return renderFeed({});
 }
 
-function card(v) {
-  const ch = state.channels.find((c) => c.channelId === v.channelId)?.title || 'Без канала';
-  const views = v.viewsOnline ?? v.viewsLocal ?? 0;
-  const p = v.duration ? Math.min(100, Math.round((v.lastTimeSec || 0) / v.duration * 100)) : 0;
-  const thumb = v.thumbUrl || '';
-  const missing = v.availability === 'missing' ? '<div class="panel">Видео недоступно — папка не найдена</div>' : '';
-  return `<article class="video-card" data-key="${v.videoKey}">
-    <img class="thumb" src="${thumb}" alt="thumb" loading="lazy" />
-    <span class="duration">${formatDuration(v.duration)}</span>
-    <div class="progress"><span style="width:${p}%"></span></div>
-    <div class="card-body"><h3>${escapeHtml(v.title)}</h3><div class="meta"><span>${escapeHtml(ch)}</span><span>${views.toLocaleString('ru-RU')} Просмотров</span></div>${missing}</div>
-  </article>`;
+function renderEmpty() {
+  const node = document.getElementById('emptyState').content.cloneNode(true);
+  node.querySelectorAll('[data-add]').forEach((b) => {
+    b.onclick = () => {
+      const t = b.dataset.add;
+      if (t === 'common') addSource('common');
+      if (t === 'channel') addSource('channel');
+      if (t === 'video') addVideoFiles();
+    };
+  });
+  els.view.replaceChildren(node);
 }
 
-function renderFeed({ shortsOnly = false, watched = false, liked = false }) {
-  let list = [...state.videos];
+function renderFeed({ shortsOnly = false, watchedOnly = false, likedOnly = false }) {
+  let list = state.videos.filter(matchesSearch);
   if (shortsOnly) list = list.filter((v) => v.type === 'shorts');
-  if (watched) list = list.filter((v) => (v.viewsLocal || 0) > 0);
-  if (liked) list = list.filter((v) => v.likedByMe);
-  list = list.filter(matchesSearch);
-  list.sort(() => Math.random() - 0.5);
+  if (watchedOnly) list = list.filter((v) => (v.viewsLocal || 0) > 0);
+  if (likedOnly) list = list.filter((v) => !!v.likedByMe);
+  list = list.sort(() => Math.random() - 0.5);
 
-  els.view.innerHTML = `<div class="filters panel">
-    <select id="fType"><option value="">Тип</option><option value="video">Видео</option><option value="shorts">Шортсы</option></select>
-    <input id="fMinDuration" type="number" placeholder="Мин. сек" />
-    <input id="fViews" type="number" placeholder="Мин. просмотры" />
-    <select id="fChannel"><option value="">Канал</option>${state.channels.map((c) => `<option value="${c.channelId}">${escapeHtml(c.title)}</option>`).join('')}</select>
+  els.view.innerHTML = `<div class="panel filters">
+    <select id="fltType"><option value="">Тип</option><option value="video">Видео</option><option value="shorts">Шортсы</option></select>
+    <input id="fltDur" type="number" placeholder="Мин. длит., сек" />
+    <input id="fltViews" type="number" placeholder="Мин. просмотры" />
+    <select id="fltChannel"><option value="">Канал</option>${state.channels.map((c) => `<option value="${c.channelId}">${escapeHtml(c.title)}</option>`).join('')}</select>
   </div>
-  <div class="grid-cards">${list.map(card).join('')}</div>`;
+  <div class="grid" id="feedGrid">${list.map(renderCard).join('')}</div>`;
 
-  const renderFiltered = () => {
-    const t = document.getElementById('fType').value;
-    const d = Number(document.getElementById('fMinDuration').value || 0);
-    const vv = Number(document.getElementById('fViews').value || 0);
-    const ch = document.getElementById('fChannel').value;
-    const filtered = list.filter((v) => (!t || v.type === t) && (!d || v.duration >= d) && (((v.viewsOnline ?? v.viewsLocal ?? 0) >= vv)) && (!ch || v.channelId === ch));
-    els.view.querySelector('.grid-cards').innerHTML = filtered.map(card).join('');
+  const apply = () => {
+    const type = q('fltType').value;
+    const minDur = Number(q('fltDur').value || 0);
+    const minViews = Number(q('fltViews').value || 0);
+    const channelId = q('fltChannel').value;
+    const filtered = list.filter((v) => {
+      const views = v.viewsOnline ?? v.viewsLocal ?? 0;
+      return (!type || v.type === type) && (!channelId || v.channelId === channelId) && (!minDur || v.duration >= minDur) && views >= minViews;
+    });
+    q('feedGrid').innerHTML = filtered.map(renderCard).join('');
     bindCards();
   };
-  ['fType', 'fMinDuration', 'fViews', 'fChannel'].forEach((id) => document.getElementById(id).oninput = renderFiltered);
+
+  ['fltType', 'fltDur', 'fltViews', 'fltChannel'].forEach((id) => q(id).oninput = apply);
   bindCards();
 }
 
-function bindCards() {
-  els.view.querySelectorAll('.video-card').forEach((el) => {
-    el.onclick = () => location.hash = `#/video/${encodeURIComponent(el.dataset.key)}`;
-    el.oncontextmenu = (e) => {
-      e.preventDefault();
-      const videoKey = el.dataset.key;
-      const action = prompt('1=Удалить из базы, 2=Копировать путь, 3=Импорт URL, 4=Импорт HTML');
-      if (action === '1') removeVideo(videoKey);
-      if (action === '2') navigator.clipboard.writeText(videoKey);
-      if (action === '3') importFromUrl(videoKey);
-      if (action === '4') importFromHtml(videoKey);
-    };
-  });
-}
-
-async function removeVideo(videoKey) {
-  await deleteByKey(state.db, 'videos', videoKey);
-  state.videos = state.videos.filter((v) => v.videoKey !== videoKey);
-  render();
-}
-
 function renderChannels() {
-  const channels = state.channels.filter((c) => c.channelId !== COMMON_CHANNEL_ID || state.videos.some((v) => v.channelId === COMMON_CHANNEL_ID));
-  els.view.innerHTML = channels.map((c) => `<div class="channel-row"><div class="panel"><div class="avatar"></div><div><h2>${escapeHtml(c.title)}</h2><div>${state.videos.filter((v) => v.channelId === c.channelId).length} видео</div></div></div><div style="display:flex;flex-direction:column;gap:8px"><button class="btn-primary" data-remove="${c.channelId}">Удалить канал</button><button class="btn-primary" data-add="${c.channelId}">Добавить видео на этот канал</button><button class="btn-primary" data-open="${c.channelId}">Открыть канал</button></div></div>`).join('');
-  els.view.querySelectorAll('[data-remove]').forEach((b) => b.onclick = () => removeChannel(b.dataset.remove));
-  els.view.querySelectorAll('[data-add]').forEach((b) => b.onclick = () => addVideosStandalone(b.dataset.add));
+  const channels = state.channels.filter((c) => c.channelId === COMMON_CHANNEL_ID || !c.system);
+  els.view.innerHTML = channels.map((c) => {
+    const count = state.videos.filter((v) => v.channelId === c.channelId).length;
+    return `<article class="channel-row">
+      <div class="panel channel-box"><div class="avatar"></div><div><h2>${escapeHtml(c.title)}</h2><div>${count} видео</div></div></div>
+      <div class="channel-actions">
+        <button class="btn" data-open="${c.channelId}">Открыть канал</button>
+        <button class="btn" data-add="${c.channelId}">Добавить видео</button>
+        ${c.channelId !== COMMON_CHANNEL_ID ? `<button class="btn secondary" data-remove="${c.channelId}">Удалить канал</button>` : ''}
+      </div>
+    </article>`;
+  }).join('');
+
   els.view.querySelectorAll('[data-open]').forEach((b) => b.onclick = () => location.hash = `#/channel/${encodeURIComponent(b.dataset.open)}`);
+  els.view.querySelectorAll('[data-add]').forEach((b) => b.onclick = () => addVideoFiles(b.dataset.add));
+  els.view.querySelectorAll('[data-remove]').forEach((b) => b.onclick = () => removeChannel(b.dataset.remove));
 }
 
-async function removeChannel(channelId) {
-  await deleteByKey(state.db, 'channels', channelId);
-  const vids = state.videos.filter((v) => v.channelId === channelId).map((v) => v.videoKey);
-  for (const key of vids) await deleteByKey(state.db, 'videos', key);
-  await hydrate();
-  renderChannels();
-}
-
-function renderChannelPage(channelId) {
+function renderSingleChannel(channelId) {
   const channel = state.channels.find((c) => c.channelId === channelId);
   if (!channel) return renderChannels();
-  const videos = state.videos.filter((v) => v.channelId === channelId).filter(matchesSearch);
-  const playlistSet = [...new Set(videos.map((v) => v.playlistPath || '').filter(Boolean))];
-  els.view.innerHTML = `<div class="panel"><h1>${escapeHtml(channel.title)}</h1><div>${videos.length} видео</div><div class="action-row"><button class="btn-primary" id="batchImportBtn">Общий парсинг URL/HTML/комментариев/лайков/названий/просмотров</button><button class="btn-primary" id="addToChannel">Добавить видео на этот канал</button><button class="btn-primary" id="rescanChannel">Обновить все видео</button></div></div><div class="filters panel"><select id="playlistFilter"><option value="">Все плейлисты</option>${playlistSet.map((p) => `<option>${escapeHtml(p)}</option>`).join('')}</select></div><div class="grid-cards" id="channelGrid">${videos.map(card).join('')}</div>`;
-  document.getElementById('addToChannel').onclick = () => addVideosStandalone(channelId);
-  document.getElementById('rescanChannel').onclick = () => rescanSource(channel.sourceId);
-  document.getElementById('batchImportBtn').onclick = () => runBatchImport(channelId);
-  document.getElementById('playlistFilter').onchange = (e) => {
-    const val = e.target.value;
-    const filtered = val ? videos.filter((v) => v.playlistPath === val) : videos;
-    document.getElementById('channelGrid').innerHTML = filtered.map(card).join('');
+  const channelVideos = state.videos.filter((v) => v.channelId === channelId).filter(matchesSearch);
+  const playlists = [...new Set(channelVideos.map((v) => v.playlistPath || '').filter(Boolean))];
+
+  els.view.innerHTML = `<article class="panel"><h1>${escapeHtml(channel.title)}</h1><div>${channelVideos.length} видео</div>
+    <div class="actions-inline">
+      <button class="btn" id="batchImportBtn">Общий парсинг URL/HTML/комментариев/лайков/названий/просмотров</button>
+      <button class="btn" id="addToChannelBtn">Добавить видео на этот канал</button>
+      <button class="btn" id="refreshChannelBtn">Обновить все видео</button>
+    </div>
+  </article>
+  <div class="panel filters"><select id="playlistFilter"><option value="">Все плейлисты</option>${playlists.map((p) => `<option>${escapeHtml(p)}</option>`).join('')}</select></div>
+  <div class="grid" id="channelGrid">${channelVideos.map(renderCard).join('')}</div>`;
+
+  q('addToChannelBtn').onclick = () => addVideoFiles(channelId);
+  q('refreshChannelBtn').onclick = () => rescanChannel(channelId);
+  q('batchImportBtn').onclick = () => batchImportChannel(channelId);
+  q('playlistFilter').onchange = () => {
+    const filter = q('playlistFilter').value;
+    const filtered = filter ? channelVideos.filter((v) => v.playlistPath === filter) : channelVideos;
+    q('channelGrid').innerHTML = filtered.map(renderCard).join('');
     bindCards();
   };
+
   bindCards();
 }
 
 async function renderVideoPage(videoKey) {
-  const v = state.videos.find((x) => x.videoKey === videoKey);
-  if (!v) return renderFeed({});
-  const file = v.fileHandle ? await v.fileHandle.getFile().catch(() => null) : null;
-  const src = file ? URL.createObjectURL(file) : '';
+  const video = state.videos.find((v) => v.videoKey === videoKey);
+  if (!video) return renderFeed({});
+
+  let src = '';
+  if (video.fileHandle && video.availability !== 'missing') {
+    const file = await video.fileHandle.getFile().catch(() => null);
+    if (file) src = URL.createObjectURL(file);
+  }
+
   const imported = await reqP(tx(state.db, 'comments_imported').stores.comments_imported.get(videoKey));
-  const local = await reqP(tx(state.db, 'comments_user').stores.comments_user.index('byVideo').getAll(videoKey));
-  const comments = [...(imported?.items || []), ...local.map((c) => ({ author: 'Вы', text: c.text }))];
+  const userComments = await reqP(tx(state.db, 'comments_user').stores.comments_user.index('byVideo').getAll(videoKey));
+  const comments = [...(imported?.items || []), ...userComments.map((x) => ({ author: 'Вы', text: x.text }))];
 
-  els.view.innerHTML = `<div class="video-page"><div><video id="videoPlayer" class="player" controls autoplay src="${src}"></video><div class="panel"><h2>${escapeHtml(v.title)}</h2><p>${escapeHtml((state.channels.find((c) => c.channelId === v.channelId)?.title) || '')}</p><div>Online просмотры: ${(v.viewsOnline || 0).toLocaleString('ru-RU')}</div><div>Local просмотры: ${(v.viewsLocal || 0).toLocaleString('ru-RU')}</div><div class="action-row"><button class="btn-primary" id="likeBtn">${v.likedByMe ? 'Убрать лайк' : 'Лайк'}</button></div></div><div class="panel"><h3>Добавить комментарий</h3><textarea id="commentText" placeholder="Ваш комментарий"></textarea><button class="btn-primary" id="commentAdd">Отправить</button></div></div><aside class="panel"><h3>Комментарии</h3><div class="comments">${comments.map((c) => `<div class="comment"><b>@${escapeHtml(c.author || 'User')}</b><div>${escapeHtml(c.text || '')}</div></div>`).join('')}</div><h3>Рекомендации</h3><div>${recommend(v).slice(0, 8).map((r) => `<div><a href="#/video/${encodeURIComponent(r.videoKey)}">${escapeHtml(r.title)}</a></div>`).join('')}</div></aside></div>`;
+  els.view.innerHTML = `<div class="video-layout">
+    <div>
+      <video id="videoPlayer" class="player" controls autoplay ${src ? `src="${src}"` : ''}></video>
+      <article class="panel">
+        <h2>${escapeHtml(video.title)}</h2>
+        <div>${escapeHtml(channelName(video.channelId))}</div>
+        <div>Online просмотры: ${(video.viewsOnline || 0).toLocaleString('ru-RU')}</div>
+        <div>Local просмотры: ${(video.viewsLocal || 0).toLocaleString('ru-RU')}</div>
+        <div class="actions-inline"><button id="likeBtn" class="btn">${video.likedByMe ? 'Убрать лайк' : 'Лайк'}</button></div>
+      </article>
+      <article class="panel">
+        <h3>Добавить комментарий</h3>
+        <textarea id="newComment" placeholder="Текст комментария"></textarea>
+        <button class="btn" id="sendCommentBtn">Отправить</button>
+      </article>
+    </div>
+    <aside class="panel">
+      <h3>Комментарии</h3>
+      <div class="comments">${comments.map((c) => `<div class="comment"><b>@${escapeHtml(c.author || 'user')}</b><div>${escapeHtml(c.text || '')}</div></div>`).join('')}</div>
+      <h3>Рекомендации</h3>
+      ${recommend(video).slice(0, 10).map((v) => `<div><a href="#/video/${encodeURIComponent(v.videoKey)}">${escapeHtml(v.title)}</a></div>`).join('')}
+    </aside>
+  </div>`;
 
-  const player = document.getElementById('videoPlayer');
-  if (v.lastTimeSec) player.currentTime = v.lastTimeSec;
-  let watchedMarked = false;
-  const interval = setInterval(async () => {
-    await updateVideo(videoKey, { lastTimeSec: player.currentTime, isFinished: player.duration ? player.currentTime / player.duration > 0.98 : false, lastWatchedAt: Date.now() });
+  const player = q('videoPlayer');
+  if (video.lastTimeSec && src) player.currentTime = video.lastTimeSec;
+
+  let viewed = false;
+  const timer = setInterval(() => {
+    if (!src) return;
+    updateVideo(videoKey, {
+      lastTimeSec: player.currentTime,
+      isFinished: player.duration ? player.currentTime / player.duration >= 0.98 : false,
+      lastWatchedAt: Date.now(),
+    });
   }, 5000);
-  player.addEventListener('timeupdate', async () => {
-    if (!watchedMarked && player.currentTime >= 2) {
-      watchedMarked = true;
-      await updateVideo(videoKey, { viewsLocal: (v.viewsLocal || 0) + 1, lastWatchedAt: Date.now() });
+
+  player.onended = () => updateVideo(videoKey, { isFinished: true, lastTimeSec: player.duration || video.lastTimeSec || 0 });
+  player.ontimeupdate = () => {
+    if (!viewed && player.currentTime >= 2) {
+      viewed = true;
+      updateVideo(videoKey, { viewsLocal: (video.viewsLocal || 0) + 1, lastWatchedAt: Date.now() });
     }
-  });
-  window.onbeforeunload = () => { player.pause(); clearInterval(interval); };
-  document.getElementById('likeBtn').onclick = () => updateVideo(videoKey, { likedByMe: !v.likedByMe }).then(hydrate).then(render);
-  document.getElementById('commentAdd').onclick = async () => {
-    const text = document.getElementById('commentText').value.trim();
-    if (!text) return;
-    const { stores, trx } = tx(state.db, 'comments_user', 'readwrite');
-    stores.comments_user.add({ videoKey, text, createdAt: Date.now() });
-    await new Promise((res, rej) => { trx.oncomplete = res; trx.onerror = () => rej(trx.error); });
+  };
+
+  q('likeBtn').onclick = async () => {
+    await updateVideo(videoKey, { likedByMe: !video.likedByMe });
+    await hydrate();
     renderVideoPage(videoKey);
   };
 
-  bindPlayerKeys(player);
-}
-
-function bindPlayerKeys(player) {
-  document.onkeydown = (e) => {
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
-    if (e.code === 'Space') { e.preventDefault(); player.paused ? player.play() : player.pause(); }
-    if (e.key === 'ArrowRight') player.currentTime += 5;
-    if (e.key === 'ArrowLeft') player.currentTime -= 5;
-    if (e.key.toLowerCase() === 'm') player.muted = !player.muted;
-    if (e.key.toLowerCase() === 'f') player.requestFullscreen?.();
+  q('sendCommentBtn').onclick = async () => {
+    const text = q('newComment').value.trim();
+    if (!text) return;
+    const { stores, trx } = tx(state.db, 'comments_user', 'readwrite');
+    stores.comments_user.add({ videoKey, text, createdAt: Date.now() });
+    await done(trx);
+    renderVideoPage(videoKey);
   };
-}
 
-function recommend(base) {
-  const sameChannel = state.videos.filter((v) => v.videoKey !== base.videoKey && v.channelId === base.channelId).map((v) => ({ score: 100, v }));
-  const baseTokens = new Set(tokenize(base.title));
-  const byWords = state.videos.filter((v) => v.videoKey !== base.videoKey).map((v) => ({ v, score: tokenize(v.title).filter((w) => baseTokens.has(w)).length * 10 - ((v.viewsLocal || 0) > 0 ? 5 : 0) }));
-  return [...sameChannel, ...byWords].sort((a, b) => b.score - a.score).map((x) => x.v);
-}
-
-function renderProfile() {
-  const apiKey = localStorage.getItem('ytApiKey') || '';
-  els.view.innerHTML = `<div class="panel" style="max-width:900px;margin:0 auto"><h1>Профиль</h1><div class="action-row"><button class="btn-primary" id="backupBtn">Сделать бэкап данных программы</button><button class="btn-primary" id="importBtn">Импортировать бэкап данных</button><button class="btn-primary" id="exportMissingBtn">Экспортировать список видео без превью/комментариев</button></div><input id="apiKey" placeholder="Ключ API KEY Youtube Data API v3" value="${escapeHtml(apiKey)}" /><h3>Ошибки / логи</h3><div id="logsWrap"></div></div>`;
-
-  document.getElementById('apiKey').onchange = (e) => localStorage.setItem('ytApiKey', e.target.value);
-  document.getElementById('backupBtn').onclick = backupExport;
-  document.getElementById('importBtn').onclick = backupImport;
-  document.getElementById('exportMissingBtn').onclick = exportMissing;
-  renderLogs();
-}
-
-async function renderLogs() {
-  const logs = await getAll(state.db, 'errors_logs');
-  const wrap = document.getElementById('logsWrap');
-  if (!wrap) return;
-  wrap.innerHTML = logs.slice(-100).reverse().map((l) => `<div class="comment"><b>${l.type}</b> ${escapeHtml(l.code || '')}<div>${escapeHtml(l.message || '')}</div></div>`).join('');
+  window.onbeforeunload = () => { player.pause(); clearInterval(timer); };
+  bindPlayerKeys(player);
 }
 
 async function addSource(type) {
   if (!window.showDirectoryPicker) return alert('File System Access API не поддерживается');
   try {
-    const dir = await window.showDirectoryPicker();
-    const sourceId = uid('source');
-    const source = { sourceId, type, name: dir.name, handle: dir, createdAt: Date.now() };
+    const handle = await window.showDirectoryPicker();
+    const source = { sourceId: uid('src'), type, name: handle.name, handle, createdAt: Date.now(), access: 'ok' };
     await putMany(state.db, 'sources', [source]);
-    await scanSource(source, true);
+    await scanSource(source, { fullRescan: true, withProgress: true });
     await hydrate();
     render();
   } catch (e) {
-    logError('source', 'PICK_CANCEL', e.message || String(e));
+    await logError('source', 'ADD_SOURCE', String(e?.message || e));
   }
 }
 
-async function addVideosStandalone(channelId = COMMON_CHANNEL_ID) {
-  if (!window.showOpenFilePicker) return alert('Не поддерживается выбор файлов');
+async function addVideoFiles(channelId = COMMON_CHANNEL_ID) {
+  if (!window.showOpenFilePicker) return alert('Выбор файлов не поддерживается');
   try {
     const handles = await window.showOpenFilePicker({ multiple: true });
-    const channel = state.channels.find((c) => c.channelId === channelId) || { channelId, title: channelId === COMMON_CHANNEL_ID ? 'Общий канал' : 'Ручной канал' };
-    if (!state.channels.some((c) => c.channelId === channel.channelId)) await putMany(state.db, 'channels', [channel]);
-    const list = [];
+    const videos = [];
     for (const fh of handles) {
       const file = await fh.getFile();
       if (!isVideoFile(file.name)) continue;
       const meta = await readVideoMeta(file);
-      list.push({
+      videos.push({
         videoKey: `${channelId}/${file.name}/${crypto.randomUUID()}`,
+        sourceId: 'manual',
         fileHandle: fh,
         title: file.name.replace(/\.[^.]+$/, ''),
         channelId,
@@ -279,36 +288,44 @@ async function addVideosStandalone(channelId = COMMON_CHANNEL_ID) {
         likedByMe: false,
       });
     }
-    await putMany(state.db, 'videos', list);
-    await generateThumbs(list);
-    await hydrate();
-    render();
+    if (videos.length) {
+      await putMany(state.db, 'videos', videos);
+      await runThumbQueue(videos, 'Генерация превью для добавленных видео');
+      await hydrate();
+      render();
+    }
   } catch (e) {
-    logError('video', 'PICK_FILE', e.message || String(e));
+    await logError('video', 'ADD_VIDEO', String(e?.message || e));
   }
 }
 
-async function scanSource(source, createChannels = false) {
-  if (!await permissionOk(source.handle)) {
-    await putMany(state.db, 'sources', [{ ...source, access: 'missing' }]);
+async function scanSource(source, { fullRescan = false, withProgress = true } = {}) {
+  const allowed = await safePermission(source.handle);
+  if (!allowed) {
+    await markSourceAvailability(source.sourceId, false);
     return;
   }
-  const channelsToPut = [];
-  const videosToPut = [];
-  const walk = async (dirHandle, base = '', channelId = null, isRoot = false) => {
+
+  if (fullRescan) {
+    const old = state.videos.filter((v) => v.sourceId === source.sourceId);
+    for (const v of old) await deleteByKey(state.db, 'videos', v.videoKey);
+  }
+
+  const discovered = [];
+
+  const scanChannelRoot = async (dirHandle, channelId, prefix = '', playlistRoot = '') => {
     for await (const [name, entry] of dirHandle.entries()) {
-      const rel = base ? `${base}/${name}` : name;
+      const relPath = prefix ? `${prefix}/${name}` : name;
       if (entry.kind === 'file' && isVideoFile(name)) {
         const file = await entry.getFile();
         const meta = await readVideoMeta(file);
-        const chId = channelId || COMMON_CHANNEL_ID;
-        videosToPut.push({
-          videoKey: `${source.sourceId}/${rel}/${name}`,
+        discovered.push({
+          videoKey: `${source.sourceId}/${relPath}/${name}`,
           sourceId: source.sourceId,
           fileHandle: entry,
           title: file.name.replace(/\.[^.]+$/, ''),
-          channelId: chId,
-          playlistPath: base.includes('/') ? base.split('/').slice(1).join('/') : '',
+          channelId,
+          playlistPath: playlistRoot,
           duration: meta.duration,
           type: detectType(meta.duration, meta.width, meta.height),
           availability: 'ok',
@@ -317,138 +334,191 @@ async function scanSource(source, createChannels = false) {
         });
       }
       if (entry.kind === 'directory') {
-        let nextChannel = channelId;
-        if (isRoot && source.type === 'common') {
-          nextChannel = uid('channel');
-          channelsToPut.push({ channelId: nextChannel, sourceId: source.sourceId, title: entry.name });
-        }
-        if (isRoot && source.type === 'channel' && createChannels && !channelId) {
-          nextChannel = uid('channel');
-          channelsToPut.push({ channelId: nextChannel, sourceId: source.sourceId, title: source.name });
-        }
-        await walk(entry, rel, nextChannel, false);
+        const nextPlaylist = playlistRoot ? `${playlistRoot}/${name}` : name;
+        await scanChannelRoot(entry, channelId, relPath, nextPlaylist);
       }
     }
   };
-  await walk(source.handle, '', null, true);
 
-  if (source.type === 'channel' && createChannels && !channelsToPut.find((c) => c.sourceId === source.sourceId)) {
-    channelsToPut.push({ channelId: uid('channel'), sourceId: source.sourceId, title: source.name });
-    videosToPut.forEach((v) => { if (!v.channelId || v.channelId === COMMON_CHANNEL_ID) v.channelId = channelsToPut[channelsToPut.length - 1].channelId; });
-  }
-  if (channelsToPut.length) await putMany(state.db, 'channels', channelsToPut);
-  if (videosToPut.length) await putMany(state.db, 'videos', videosToPut);
-  await generateThumbs(videosToPut);
-}
+  const walkCommon = async () => {
+    // 1) root files -> Общий канал
+    for await (const [name, entry] of source.handle.entries()) {
+      if (entry.kind === 'file' && isVideoFile(name)) {
+        const file = await entry.getFile();
+        const meta = await readVideoMeta(file);
+        discovered.push({
+          videoKey: `${source.sourceId}/${name}/${name}`,
+          sourceId: source.sourceId,
+          fileHandle: entry,
+          title: file.name.replace(/\.[^.]+$/, ''),
+          channelId: COMMON_CHANNEL_ID,
+          playlistPath: '',
+          duration: meta.duration,
+          type: detectType(meta.duration, meta.width, meta.height),
+          availability: 'ok',
+          viewsLocal: 0,
+          likedByMe: false,
+        });
+      }
+    }
 
-async function rescanSource(sourceId) {
-  const source = state.sources.find((s) => s.sourceId === sourceId);
-  if (!source) return;
-  const existing = state.videos.filter((v) => v.sourceId === sourceId);
-  existing.forEach((v) => v._seen = false);
-
-  const discovered = [];
-  const walk = async (dir, base='') => {
-    for await (const [name, entry] of dir.entries()) {
-      const rel = base ? `${base}/${name}` : name;
-      if (entry.kind === 'file' && isVideoFile(name)) discovered.push(rel);
-      if (entry.kind === 'directory') await walk(entry, rel);
+    // 2) first-level folders -> отдельные каналы
+    for await (const [name, entry] of source.handle.entries()) {
+      if (entry.kind !== 'directory') continue;
+      const channelId = `ch-${source.sourceId}-${name}`;
+      await putMany(state.db, 'channels', [{ channelId, sourceId: source.sourceId, title: name }]);
+      await scanChannelRoot(entry, channelId, name, '');
     }
   };
-  await walk(source.handle);
 
-  const keep = new Set(discovered.map((rel) => `${sourceId}/${rel}/${rel.split('/').pop()}`));
-  const toDelete = existing.filter((v) => !keep.has(v.videoKey));
-  for (const v of toDelete) await deleteByKey(state.db, 'videos', v.videoKey);
-  await scanSource(source, false);
-  await hydrate();
-  render();
+  const walkSingleChannel = async () => {
+    const channelId = `ch-${source.sourceId}`;
+    await putMany(state.db, 'channels', [{ channelId, sourceId: source.sourceId, title: source.name }]);
+    await scanChannelRoot(source.handle, channelId, '', '');
+  };
+
+  if (withProgress) setTaskPanel('Сканирование папки...', 0);
+  if (source.type === 'common') await walkCommon();
+  if (source.type === 'channel') await walkSingleChannel();
+
+  if (discovered.length) {
+    await putMany(state.db, 'videos', discovered);
+    if (withProgress) setTaskPanel('Сканирование завершено. Генерация превью...', 15);
+    await runThumbQueue(discovered, 'Генерация превью');
+  }
+
+  hideTaskPanel();
 }
 
-async function generateThumbs(videos) {
-  if (!videos.length) return;
-  const panel = els.bulkPanel;
-  panel.classList.remove('hidden');
-  panel.innerHTML = `<div class="queue-row"><div id="queueLabel">Генерация превью...</div><button id="pauseQ" class="btn-primary">Пауза</button><button id="resumeQ" class="btn-primary">Продолжить</button><button id="cancelQ" class="btn-primary">Отмена</button></div><progress id="queueProgress" max="100" value="0"></progress>`;
+async function rescanChannel(channelId) {
+  const channel = state.channels.find((c) => c.channelId === channelId);
+  if (!channel || channel.sourceId === 'system') return;
+  const source = state.sources.find((s) => s.sourceId === channel.sourceId);
+  if (!source) return;
+  await scanSource(source, { fullRescan: true, withProgress: true });
+  await hydrate();
+  renderSingleChannel(channelId);
+}
 
-  const q = new BatchQueue({
+async function runThumbQueue(videos, title = 'Генерация превью') {
+  if (!videos.length) return;
+
+  const queue = new BatchQueue({
     batchSize: 10,
     onProgress: ({ done, total }) => {
-      panel.querySelector('#queueLabel').textContent = `Генерация превью ${done}/${total}`;
-      panel.querySelector('#queueProgress').value = total ? Math.round(done / total * 100) : 0;
-    }
+      const p = total ? Math.round((done / total) * 100) : 0;
+      setTaskPanel(`${title}: ${done}/${total}`, p, queue);
+    },
   });
-  panel.querySelector('#pauseQ').onclick = () => q.pause();
-  panel.querySelector('#resumeQ').onclick = () => q.resume();
-  panel.querySelector('#cancelQ').onclick = () => q.cancel();
 
-  videos.forEach((v) => q.add(async () => {
+  videos.forEach((video) => queue.add(async () => {
     try {
-      const file = await v.fileHandle.getFile();
-      const blob = await makeThumb(file);
+      const file = await video.fileHandle.getFile();
+      const thumbBlob = await makeThumb(file);
       const { stores, trx } = tx(state.db, ['thumbs', 'videos'], 'readwrite');
-      stores.thumbs.put({ videoKey: v.videoKey, thumbBlob: blob });
-      const vv = await reqP(stores.videos.get(v.videoKey));
-      vv.thumbUrl = URL.createObjectURL(blob);
-      stores.videos.put(vv);
-      await new Promise((res, rej) => { trx.oncomplete = res; trx.onerror = () => rej(trx.error); });
+      stores.thumbs.put({ videoKey: video.videoKey, thumbBlob });
+      const cur = await reqP(stores.videos.get(video.videoKey));
+      if (cur) stores.videos.put({ ...cur, thumbUrl: URL.createObjectURL(thumbBlob) });
+      await done(trx);
     } catch (e) {
-      logError('thumb', 'THUMB_FAIL', e.message || String(e), { videoKey: v.videoKey });
+      await logError('thumb', 'THUMB_GENERATION', String(e?.message || e), { videoKey: video.videoKey });
     }
   }));
 
-  await q.run();
-  panel.classList.add('hidden');
-  await hydrate();
+  setTaskPanel(`${title}: 0/${videos.length}`, 0, queue);
+  await queue.run();
+  hideTaskPanel();
 }
 
-async function runBatchImport(channelId) {
-  const vids = state.videos.filter((v) => v.channelId === channelId);
-  if (!vids.length) return;
-  const q = new BatchQueue({ batchSize: 10, onProgress: ({ done, total }) => {
-    els.bulkPanel.classList.remove('hidden');
-    els.bulkPanel.innerHTML = `<div class="panel">Общий импорт: ${done}/${total}</div>`;
-  }});
-  vids.forEach((v) => q.add(async () => {
-    const fakeViews = Math.floor(Math.random() * 1500000);
-    await updateVideo(v.videoKey, { viewsOnline: fakeViews, likesOnline: Math.floor(fakeViews * 0.04) });
+async function batchImportChannel(channelId) {
+  const videos = state.videos.filter((v) => v.channelId === channelId);
+  if (!videos.length) return;
+  const queue = new BatchQueue({
+    batchSize: 10,
+    onProgress: ({ done, total }) => setTaskPanel(`Импорт данных канала: ${done}/${total}`, Math.round((done / total) * 100), queue),
+  });
+
+  videos.forEach((v) => queue.add(async () => {
+    const viewsOnline = Math.floor(Math.random() * 1_500_000);
+    await updateVideo(v.videoKey, { viewsOnline, likesOnline: Math.floor(viewsOnline * 0.03) });
   }));
-  await q.run();
-  els.bulkPanel.classList.add('hidden');
+
+  setTaskPanel(`Импорт данных канала: 0/${videos.length}`, 0, queue);
+  await queue.run();
+  hideTaskPanel();
   await hydrate();
-  render();
+  renderSingleChannel(channelId);
 }
 
-async function importFromUrl(videoKey) {
-  const url = prompt('Вставьте URL');
-  if (!url) return;
-  const v = state.videos.find((x) => x.videoKey === videoKey);
-  if (!v) return;
-  const title = prompt('Название с URL', v.title) || v.title;
-  await updateVideo(videoKey, { sourceUrl: url, title, viewsOnline: Math.floor(Math.random() * 900000), likesOnline: Math.floor(Math.random() * 30000) });
-  await putMany(state.db, 'comments_imported', [{ videoKey, items: Array.from({ length: 6 }).map((_, i) => ({ author: `user${i + 1}`, text: `Импортированный комментарий #${i + 1}` })) }]);
+async function removeChannel(channelId) {
+  await deleteByKey(state.db, 'channels', channelId);
+  const ownVideos = state.videos.filter((v) => v.channelId === channelId);
+  for (const v of ownVideos) await deleteByKey(state.db, 'videos', v.videoKey);
   await hydrate();
-  render();
+  renderChannels();
 }
 
-async function importFromHtml(videoKey) {
-  const html = prompt('Вставьте HTML (упрощённый режим)');
-  if (!html) return;
-  const doc = new DOMParser().parseFromString(html, 'text/html');
-  const title = doc.querySelector('title')?.textContent?.trim();
-  const viewsText = (doc.body.textContent.match(/[\d\s.,]+\s*просмотр/iu) || [])[0] || '';
-  const views = Number((viewsText.match(/[\d\s.,]+/) || ['0'])[0].replace(/\D/g, ''));
-  await updateVideo(videoKey, { title: title || state.videos.find((v) => v.videoKey === videoKey)?.title, viewsOnline: views || undefined });
+function renderProfile() {
+  const apiKey = localStorage.getItem('ytApiKey') || '';
+  els.view.innerHTML = `<article class="panel">
+    <h1>Профиль</h1>
+    <div class="actions-inline">
+      <button class="btn" id="backupBtn">Сделать бэкап данных программы</button>
+      <button class="btn" id="importBackupBtn">Импортировать бэкап данных</button>
+      <button class="btn" id="exportMissingBtn">Экспортировать список видео без превью/комментариев</button>
+    </div>
+    <input id="apiKeyInput" placeholder="Ключ API KEY Youtube Data API v3" value="${escapeHtml(apiKey)}" />
+    <h3>Источники</h3>
+    <div>${state.sources.map((s) => `<div class="comment">${escapeHtml(s.name)} — ${s.access === 'missing' ? 'Нет доступа' : 'ОК'} ${s.access === 'missing' ? `<button class="btn" data-restore="${s.sourceId}">Восстановить доступ</button>` : ''}</div>`).join('') || '<div class="comment">Нет источников</div>'}</div>
+    <h3>Ошибки / логи</h3>
+    <div id="logsWrap"></div>
+  </article>`;
+
+  q('apiKeyInput').onchange = (e) => localStorage.setItem('ytApiKey', e.target.value.trim());
+  q('backupBtn').onclick = backupExport;
+  q('importBackupBtn').onclick = backupImport;
+  q('exportMissingBtn').onclick = exportMissing;
+  els.view.querySelectorAll('[data-restore]').forEach((b) => b.onclick = () => restoreSource(b.dataset.restore));
+  renderLogs();
+}
+
+async function restoreSource(sourceId) {
+  const source = state.sources.find((s) => s.sourceId === sourceId);
+  if (!source) return;
+  const ok = await safePermission(source.handle);
+  await markSourceAvailability(source.sourceId, ok);
   await hydrate();
-  render();
+  renderProfile();
+}
+
+async function renderLogs() {
+  const logs = await getAll(state.db, 'errors_logs');
+  const wrap = document.getElementById('logsWrap');
+  if (!wrap) return;
+  wrap.innerHTML = logs.slice(-100).reverse().map((l) => `<div class="comment"><b>${escapeHtml(l.type)}</b> [${escapeHtml(l.code || '')}]<div>${escapeHtml(l.message || '')}</div></div>`).join('') || '<div class="comment">Логов нет</div>';
+}
+
+async function markSourceAvailability(sourceId, isAvailable) {
+  const { stores, trx } = tx(state.db, ['sources', 'videos'], 'readwrite');
+  const src = await reqP(stores.sources.get(sourceId));
+  if (src) stores.sources.put({ ...src, access: isAvailable ? 'ok' : 'missing' });
+
+  const all = await reqP(stores.videos.getAll());
+  all.filter((v) => v.sourceId === sourceId).forEach((v) => {
+    stores.videos.put({
+      ...v,
+      availability: isAvailable ? 'ok' : 'missing',
+      missingReason: isAvailable ? '' : 'Видео недоступно — папка не найдена',
+    });
+  });
+  await done(trx);
 }
 
 async function updateVideo(videoKey, patch) {
   const { stores, trx } = tx(state.db, 'videos', 'readwrite');
-  const v = await reqP(stores.videos.get(videoKey));
-  if (!v) return;
-  stores.videos.put({ ...v, ...patch });
-  await new Promise((res, rej) => { trx.oncomplete = res; trx.onerror = () => rej(trx.error); });
+  const cur = await reqP(stores.videos.get(videoKey));
+  if (cur) stores.videos.put({ ...cur, ...patch });
+  await done(trx);
 }
 
 async function backupExport() {
@@ -464,67 +534,146 @@ async function backupExport() {
     },
     localStorage: { ytApiKey: localStorage.getItem('ytApiKey') || '' },
   };
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
-  downloadBlob(blob, `mytube-backup-${new Date().toISOString().slice(0, 10)}.json`);
+  downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' }), `mytube-backup-${new Date().toISOString().slice(0, 10)}.json`);
 }
 
 async function backupImport() {
   if (!window.showOpenFilePicker) return;
   const [handle] = await window.showOpenFilePicker({ types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }] });
-  const text = await (await handle.getFile()).text();
-  const data = JSON.parse(text);
-
-  const mapCurrent = new Map(state.videos.map((v) => [v.videoKey, v]));
-  const merged = [...mapCurrent.values()];
-
-  for (const iv of (data.db?.videos || [])) {
-    const cur = mapCurrent.get(iv.videoKey);
-    if (!cur) {
-      merged.push(iv);
-      continue;
-    }
-    const score = (x) => Number(!!x.thumbUrl) + Number(!!x.viewsOnline || !!x.likesOnline) + Number((x.commentsImported || 0) > 0) + Number((x.lastTimeSec || 0) > 0 || !!x.lastWatchedAt);
-    if (score(iv) > score(cur)) {
-      Object.assign(cur, iv);
-    }
-  }
+  const data = JSON.parse(await (await handle.getFile()).text());
 
   await putMany(state.db, 'channels', data.db?.channels || []);
+
+  const currentVideos = new Map((await getAll(state.db, 'videos')).map((v) => [v.videoKey, v]));
+  const incomingVideos = data.db?.videos || [];
+  const merged = [...currentVideos.values()];
+
+  const weight = (v) => Number(!!v.thumbUrl) + Number(!!v.viewsOnline || !!v.likesOnline) + Number((v.commentsImported || 0) > 0) + Number(!!v.lastTimeSec || !!v.lastWatchedAt);
+
+  for (const incoming of incomingVideos) {
+    const cur = currentVideos.get(incoming.videoKey);
+    if (!cur) {
+      merged.push(incoming);
+      continue;
+    }
+    if (weight(incoming) > weight(cur)) Object.assign(cur, incoming);
+  }
+
   await putMany(state.db, 'videos', merged);
-  await putMany(state.db, 'comments_user', data.db?.comments_user || []);
   await putMany(state.db, 'comments_imported', data.db?.comments_imported || []);
   await putMany(state.db, 'errors_logs', data.db?.errors_logs || []);
   localStorage.setItem('ytApiKey', data.localStorage?.ytApiKey || '');
+
   await hydrate();
   render();
 }
 
-async function exportMissing() {
-  const missing = state.videos.filter((v) => !v.thumbUrl || !(v.viewsOnline || v.likesOnline));
-  downloadBlob(new Blob([JSON.stringify(missing, null, 2)], { type: 'application/json' }), 'mytube-missing-data.json');
+function exportMissing() {
+  const data = state.videos.filter((v) => !v.thumbUrl || !(v.viewsOnline || v.likesOnline));
+  downloadBlob(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }), 'videos-missing-data.json');
 }
 
-function refreshPopular() {
-  const watchedByChannel = new Map();
-  state.videos.forEach((v) => {
-    if ((v.viewsLocal || 0) <= 0) return;
-    if (!watchedByChannel.has(v.channelId)) watchedByChannel.set(v.channelId, new Set());
-    watchedByChannel.get(v.channelId).add(v.videoKey);
+function renderCard(v) {
+  const progress = v.duration ? Math.min(100, Math.round(((v.lastTimeSec || 0) / v.duration) * 100)) : 0;
+  const views = v.viewsOnline ?? v.viewsLocal ?? 0;
+  return `<article class="card" data-video="${v.videoKey}">
+    <img class="thumb" loading="lazy" alt="thumbnail" src="${v.thumbUrl || ''}" />
+    <span class="dur">${formatDuration(v.duration)}</span>
+    <div class="progress"><span style="width:${progress}%"></span></div>
+    <div class="card-body">
+      <h3 class="title">${escapeHtml(v.title)}</h3>
+      <div class="meta"><span>${escapeHtml(channelName(v.channelId))}</span><span>${views.toLocaleString('ru-RU')} просмотров</span></div>
+      ${v.availability === 'missing' ? `<div class="warn">Видео недоступно — папка не найдена</div>` : ''}
+    </div>
+  </article>`;
+}
+
+function bindCards() {
+  els.view.querySelectorAll('[data-video]').forEach((el) => {
+    el.onclick = () => location.hash = `#/video/${encodeURIComponent(el.dataset.video)}`;
   });
-  const sorted = [...watchedByChannel.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 5);
-  els.popular.innerHTML = sorted.map(([cid]) => `<li>${escapeHtml(state.channels.find((c) => c.channelId === cid)?.title || cid)}</li>`).join('');
+}
+
+function recommend(base) {
+  const baseWords = new Set(tokenize(base.title));
+  return [...state.videos]
+    .filter((v) => v.videoKey !== base.videoKey)
+    .map((v) => ({
+      v,
+      score: (v.channelId === base.channelId ? 100 : 0) + tokenize(v.title).filter((w) => baseWords.has(w)).length * 8 - ((v.viewsLocal || 0) > 0 ? 4 : 0),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .map((x) => x.v);
+}
+
+function bindPlayerKeys(player) {
+  document.onkeydown = (e) => {
+    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) return;
+    if (e.code === 'Space') { e.preventDefault(); player.paused ? player.play() : player.pause(); }
+    if (e.key === 'ArrowRight') player.currentTime += 5;
+    if (e.key === 'ArrowLeft') player.currentTime -= 5;
+    if (e.key.toLowerCase() === 'm') player.muted = !player.muted;
+    if (e.key.toLowerCase() === 'f') player.requestFullscreen?.();
+  };
+}
+
+function refreshPopularChannels() {
+  const map = new Map();
+  for (const v of state.videos) {
+    if ((v.viewsLocal || 0) <= 0) continue;
+    if (!map.has(v.channelId)) map.set(v.channelId, new Set());
+    map.get(v.channelId).add(v.videoKey);
+  }
+  const top = [...map.entries()].sort((a, b) => b[1].size - a[1].size).slice(0, 5);
+  els.popular.innerHTML = top.map(([cid]) => `<li>${escapeHtml(channelName(cid))}</li>`).join('') || '<li>Нет данных</li>';
+}
+
+function matchesSearch(video) {
+  if (!state.search) return true;
+  return `${video.title} ${channelName(video.channelId)}`.toLowerCase().includes(state.search);
+}
+
+function channelName(id) {
+  return state.channels.find((c) => c.channelId === id)?.title || 'Без канала';
 }
 
 async function logError(type, code, message, extra = {}) {
   const { stores, trx } = tx(state.db, 'errors_logs', 'readwrite');
   stores.errors_logs.add({ type, code, message, extra, createdAt: Date.now() });
-  await new Promise((res, rej) => { trx.oncomplete = res; trx.onerror = () => rej(trx.error); });
+  await done(trx);
 }
 
-function downloadBlob(blob, filename) {
+function setTaskPanel(label, progressValue = 0, queue = null) {
+  els.task.classList.remove('hidden');
+  els.task.innerHTML = `<div class="task-row"><div>${escapeHtml(label)}</div>
+    <button class="btn secondary" id="taskPause">Пауза</button>
+    <button class="btn secondary" id="taskResume">Продолжить</button>
+    <button class="btn secondary" id="taskCancel">Отмена</button></div>
+    <progress max="100" value="${progressValue}"></progress>`;
+
+  q('taskPause').onclick = () => queue?.pause();
+  q('taskResume').onclick = () => queue?.resume();
+  q('taskCancel').onclick = () => queue?.cancel();
+}
+
+function hideTaskPanel() {
+  els.task.classList.add('hidden');
+  els.task.innerHTML = '';
+}
+
+function q(id) { return document.getElementById(id); }
+
+function done(trx) {
+  return new Promise((resolve, reject) => {
+    trx.oncomplete = resolve;
+    trx.onerror = () => reject(trx.error);
+  });
+}
+
+function downloadBlob(blob, name) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = filename;
+  a.download = name;
   a.click();
   URL.revokeObjectURL(a.href);
 }
